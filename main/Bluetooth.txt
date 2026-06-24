@@ -1,0 +1,349 @@
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_log.h"
+#include "esp_nimble_hci.h"
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+#include "sdkconfig.h"
+#include "driver/gpio.h"
+#include "esp_system.h"
+
+void esp__reset() {
+    // Do something
+    esp_restart();  // Reboots the ESP32
+}
+
+#define MAX_SENSORS 8
+#define MAX_NAME_LEN 10
+
+static uint16_t current_conn_handle = 0;
+uint16_t status_char_handle;
+bool ble_stop_requested = false;
+
+typedef struct {
+    char name[MAX_NAME_LEN];
+    float value;
+} sensor_t;
+
+sensor_t sensors[MAX_SENSORS];
+uint8_t sensor_count = MAX_SENSORS;
+
+char *TAG = "BLE-Server";
+uint8_t ble_addr_type;
+struct ble_gap_adv_params adv_params;
+bool status = false;
+bool ble_ready = false;
+bool ble_connected = false;
+void ble_app_advertise(void);
+
+
+
+void add_sensor(const char* sensor_name) {
+    if (sensor_count < MAX_SENSORS) {
+        strncpy(sensors[sensor_count].name, sensor_name, MAX_NAME_LEN - 1);
+        sensors[sensor_count].name[MAX_NAME_LEN - 1] = '\0';
+        sensors[sensor_count].value = 0.0;
+        sensor_count++;
+    }
+}
+
+
+
+static int ble_data_read(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    char data_str[256] = "DATA:";
+
+    for (int i = 0; i < sensor_count; i++) {
+        char temp[40];
+        snprintf(sensors[i].name, MAX_NAME_LEN, "SENSOR%d", i + 1);
+        sensors[i].value = (float)(i * 10 + 1.23);
+        snprintf(temp, sizeof(temp), "%s=%.2f", sensors[i].name, sensors[i].value);
+        strcat(data_str, temp);
+        if (i < sensor_count - 1) strcat(data_str, ", ");
+    }
+
+    printf("%s\n", data_str);
+    os_mbuf_append(ctxt->om, data_str, strlen(data_str));
+    return 0;
+}
+
+
+
+static int ble_config_write(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    char command[100] = {0};
+    memcpy(command, ctxt->om->om_data, ctxt->om->om_len);
+    command[ctxt->om->om_len] = '\0';
+    ESP_LOGI("BLE_CONFIG", "Received: %s", command);
+
+    if (strncmp(command, "SET:SENSOR=", 11) == 0) {
+        sensor_count = atoi(&command[11]);
+        if(sensor_count > MAX_SENSORS) sensor_count = MAX_SENSORS;
+        ESP_LOGI("BLE_CONFIG", "Sensor count set to %d", sensor_count);
+    } 
+    else if (strncmp(command, "SET:ID", 6) == 0) {
+        int index = command[6] - '1';
+        if(index >= 0 && index < MAX_SENSORS) {
+            strncpy(sensors[index].name, strchr(command, '=') + 1, MAX_NAME_LEN - 1);
+            sensors[index].name[MAX_NAME_LEN - 1] = '\0';
+            ESP_LOGI("BLE_CONFIG", "Sensor %d set to %s", index+1, sensors[index].name);
+        }
+    }
+
+    return 0;
+}
+
+static int dummy_access_cb(uint16_t conn_handle, uint16_t attr_handle,
+                          struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    return 0;
+}
+
+
+static const struct ble_gatt_svc_def gatt_svcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = BLE_UUID16_DECLARE(0x180),
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {
+                .uuid = BLE_UUID16_DECLARE(0xFFF1),
+                .flags = BLE_GATT_CHR_F_WRITE,
+                .access_cb = ble_config_write
+            },
+            {
+                .uuid = BLE_UUID16_DECLARE(0xFFF2),
+                .flags = BLE_GATT_CHR_F_READ,
+                .access_cb = ble_data_read
+            },
+			{
+			    .uuid = BLE_UUID16_DECLARE(0xFFF3),
+			    .access_cb = dummy_access_cb,  // ✅ must exist
+			    .flags = BLE_GATT_CHR_F_NOTIFY,
+			    .val_handle = &status_char_handle
+			},
+            { 0 }
+        }
+    },
+    { 0 }
+};
+
+static int ble_gap_event(struct ble_gap_event *event, void *arg) {
+    switch (event->type) {
+        case BLE_GAP_EVENT_CONNECT:
+            ESP_LOGI("GAP", "BLE GAP EVENT CONNECT %s", event->connect.status == 0 ? "OK!" : "FAILED!");
+            if (event->connect.status == 0) {
+				ESP_LOGI("GAP", "Conn handle received: %d", event->connect.conn_handle);
+                current_conn_handle = event->connect.conn_handle;
+                ble_connected = true;
+            } else {
+                ble_app_advertise();
+            }
+            break;
+        case BLE_GAP_EVENT_DISCONNECT:
+            ESP_LOGI("GAP", "BLE GAP EVENT DISCONNECTED");
+            current_conn_handle = 0;
+            ble_connected = false;
+            
+			if (ble_stop_requested) 
+			{
+		        ble_stop_requested = false;
+		
+		        ESP_LOGI(TAG, "Finalizing BLE shutdown after disconnect...");
+		
+		        nimble_port_stop();
+		        nimble_port_deinit();
+		        ESP_LOGI(TAG, "BLE fully stopped and memory released.");
+		       
+		    }
+		     
+		    else 
+		    {
+		        ble_app_advertise();  // resume advertising if not shutting down
+		    }
+
+            break;
+        case BLE_GAP_EVENT_ADV_COMPLETE:
+            ESP_LOGI("GAP", "BLE GAP EVENT ADV COMPLETE");
+            ble_app_advertise();
+            break;
+        default:
+            break;
+    }
+    return 0;
+}
+
+void ble_app_advertise(void) {
+    if (!ble_ready) return;
+
+    struct ble_hs_adv_fields fields;
+    const char *device_name;
+
+    memset(&fields, 0, sizeof(fields));
+    device_name = ble_svc_gap_device_name();
+    fields.name = (uint8_t *)device_name;
+    fields.name_len = strlen(device_name);
+    fields.name_is_complete = 1;
+    ble_gap_adv_set_fields(&fields);
+
+    memset(&adv_params, 0, sizeof(adv_params));
+    adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
+    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+
+    ble_gap_adv_start(ble_addr_type, NULL, BLE_HS_FOREVER, &adv_params, ble_gap_event, NULL);
+}
+
+void ble_app_on_sync(void) {
+    ble_hs_id_infer_auto(0, &ble_addr_type);
+    ble_ready = true;
+    ble_app_advertise();
+}
+
+void host_task(void *param) {
+    nimble_port_run();
+}
+
+
+void connect_ble(void) {
+    nvs_flash_init();
+    nimble_port_init();
+    ble_svc_gap_device_name_set("BLE-Server");
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    ble_gatts_count_cfg(gatt_svcs);
+    ble_gatts_add_svcs(gatt_svcs);
+    ble_hs_cfg.sync_cb = ble_app_on_sync;
+    nimble_port_freertos_init(host_task);
+}
+
+void status_notify(const char *message) {
+    printf("Notify call received.\n");
+    printf("conn_handle: %d, char_handle: %d\n", current_conn_handle, status_char_handle);
+	
+    if (current_conn_handle == BLE_HS_CONN_HANDLE_NONE || status_char_handle == 0) {
+        printf("Not notifying: Condition failed (conn_handle == 0 or char_handle == 0)\n");
+        return;
+    }
+
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(message, strlen(message));
+    ble_gattc_notify_custom(current_conn_handle, status_char_handle, om);
+    printf("Notified: %s\n", message);
+}
+
+
+
+
+
+void fake_notify_loop(void *param) {
+    int counter = 0;
+    char json_msg[64];
+
+    while (1) {
+		if( ble_ready && ble_connected)
+		{
+			snprintf(json_msg, sizeof(json_msg), "{\"count\": %d}", counter++);
+	        if (counter >= 1500) counter = 0;
+	        status_notify(json_msg);
+	        vTaskDelay(pdMS_TO_TICKS(2000));
+		}
+		
+		vTaskDelay(10);
+    }
+}
+
+
+void stop_ble();
+
+
+void boot_creds_clear(void *param) {
+    int64_t m = esp_timer_get_time();
+    status = true;
+
+    while (1) {
+        if (!gpio_get_level(GPIO_NUM_0)) {
+            int64_t n = esp_timer_get_time();
+            if ((n - m) / 1000 >= 2000 && ble_ready) {
+                ESP_LOGI("BOOT BUTTON:", "Button Pressed FOR 3 SECOND\n");
+/*                adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
+                adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+                ble_gap_adv_start(ble_addr_type, NULL, BLE_HS_FOREVER, &adv_params, ble_gap_event, NULL);*/
+                stop_ble();
+                status = true;
+                vTaskDelay(100);
+                m = esp_timer_get_time();
+            }
+        } else {
+            m = esp_timer_get_time();
+        }
+
+        vTaskDelay(10);
+
+        if (status && ble_ready) {
+            adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
+            adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+            ble_gap_adv_start(ble_addr_type, NULL, BLE_HS_FOREVER, &adv_params, ble_gap_event, NULL);
+            
+        }
+    }
+}
+
+static const char *TAG1 = "BLE_STOP";
+
+
+// This function stops advertising and/or scanning, then terminates any active connection
+void stop_ble(void) 
+{
+    ESP_LOGI(TAG, "Stopping BLE activities...");
+
+    ble_gap_adv_stop();
+    ble_gap_disc_cancel();
+
+    if (ble_connected) {
+        ESP_LOGI(TAG, "Disconnecting BLE connection handle=%d", current_conn_handle);
+        int rc = ble_gap_terminate(current_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "Failed to disconnect, err=%d", rc);
+        } else {
+            ble_stop_requested = true; // Wait for disconnect event to finalize shutdown
+            return;
+        }
+    }
+
+    // If not connected, shutdown now
+    ESP_LOGI(TAG, "No active connection. Finalizing BLE shutdown...");
+
+    nimble_port_stop();
+    nimble_port_deinit();
+
+    ble_connected = false;
+    ESP_LOGI(TAG, "BLE fully stopped and memory released.");
+}
+
+
+/*void stop_ble() {
+    if (!ble_hs_is_enabled()) {
+        ESP_LOGI(TAG, "BLE already deinited");
+        return;
+    }
+    if (nimble_port_stop() != 0) {
+        ESP_LOGE(TAG, "nimble_port_stop() failed");
+        return;
+    }
+    nimble_port_deinit(); // Or nimble_port_deinit(); if using nimble_port_init()
+    // esp_bt_mem_release(ESP_BT_MODE_BLE); // Use if needed for memory release
+    ESP_LOGI(TAG, "BLE stopped");
+}*/
+
+void app_main() {
+    gpio_set_direction(GPIO_NUM_0, GPIO_MODE_INPUT);
+    gpio_set_direction(GPIO_NUM_2, GPIO_MODE_OUTPUT);
+    gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
+
+    connect_ble();
+    
+    xTaskCreate(boot_creds_clear, "boot_creds_clear", 2048, NULL, 5, NULL);
+    xTaskCreate(fake_notify_loop, "fake_notify_loop", 2048, NULL, 5, NULL);
+}
