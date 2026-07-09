@@ -1,3 +1,5 @@
+// tds scaling factor adjusted to 0.5 from 0.7 as per request on 30 june 2026 from Rohit
+
 #include <stdio.h>
 #include <stdbool.h>
 #include <unistd.h>
