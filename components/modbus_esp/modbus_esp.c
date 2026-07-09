@@ -1,3 +1,4 @@
+// tds scaling factor adjusted to 0.5 from 0.7 as per request on 30 june 2026 from Rohit
 #include <stdio.h>
 #include "modbus_esp.h"
 #include <math.h>
@@ -443,9 +444,9 @@ uint16_t modbus_crc(uint8_t *data, uint8_t len) {
 
 
 float decodeModbusResponse_TDS(uint8_t *receivedData)
-{
+{ //scale factor updated to 0.5 from 0.7 as per request on 30 june 2026
   uint16_t data = (receivedData[3] << 8) | receivedData[4];
-  float tds = (float) data * 0.7;
+  float tds = (float) data * 0.5;  // Scaling factor is 0.5, as per Rohit
   return tds;
 }
 
